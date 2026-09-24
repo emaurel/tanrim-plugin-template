@@ -36,6 +36,11 @@ HERE = Path(__file__).resolve().parents[1]
 #: the same machinery that will run it.
 PLUGIN = discovery.load(HERE)
 
+#: The same module object, so a test can reach the job functions and stub the
+#: `run_agent` the plugin imported. `discovery.load` registers it under
+#: `tanrim_plugins.<directory>`, which is where the server finds it too.
+plugin_module = sys.modules[f"tanrim_plugins.{HERE.name}"]
+
 
 @pytest.fixture
 def env():
@@ -44,13 +49,15 @@ def env():
     Alone on purpose: a test that boots everything installed asserts against
     whatever else happens to be in `plugins/`, and then fails for a good
     reason the day a second plugin arrives.
+
+    `boot` invalidates every derived cache itself, as its last step, so this
+    needs nothing else. Reaching into the core's privates to do it again is
+    the habit this template exists NOT to teach.
     """
     environment.reset()
-    environment._invalidate_derived()
     made = environment.boot([PLUGIN])
     yield made
     environment.reset()
-    environment._invalidate_derived()
 
 
 def test_it_boots(env):
@@ -112,11 +119,69 @@ def test_every_declared_prompt_is_on_disk():
     assert PLUGIN.check() == []
 
 
+def test_a_gated_stage_is_declared_on_a_bench(env):
+    """A step gate at a stage no bench works is never raised.
+
+    The orchestrator asks `role_for_stage` BEFORE it asks whether the move is
+    the operator's, and that answers from bench declarations alone. With no
+    bench naming the stage it answers None, the loop moves on, and the record
+    sits there for ever with no error anywhere — which is exactly what this
+    template shipped until a review caught it.
+    """
+    worked = {s for r in env.rooms() for b in r.workbenches for s in b.stages}
+    for step in PLUGIN.step_gates():
+        assert step.stage in worked, (
+            f"step gate at {step.stage!r} is on no bench, so "
+            f"role_for_stage({step.stage!r}) is None and the card never "
+            f"appears")
+
+
 def test_a_gate_exists_for_every_gate_that_is_raised(env):
     """A `StepGate` naming a kind no `Gate` defines raises a card that nothing
     knows how to resolve."""
-    defined = set(env.gates())
+    defined = set(env.gates().keys())
     for step in PLUGIN.step_gates():
         assert step.gate in defined, (
             f"step gate at {step.stage!r} raises {step.gate!r}, which no "
             f"Gate() defines")
+
+
+def test_the_job_runs_and_moves_the_record(env, tmp_path, monkeypatch):
+    """The agent's job, actually CALLED, with the model stubbed out.
+
+    Every other test here reads what the plugin DECLARES. This one runs it —
+    and it is the cheapest test in the file, because the job is four lines of
+    plumbing around one model call.
+
+    It is here because the template shipped for a while calling
+    `state.get_lead` and `state.advance_lead`, neither of which exists. The
+    plugin booted perfectly, the whole suite was green, and it died with an
+    `AttributeError` the first time anyone pressed Run. Nothing that only
+    reads a manifest can catch that.
+    """
+    import asyncio
+
+    from tanrim import agent_helpers, state
+
+    # A ledger of its own. Without this the test writes into the real
+    # `state/leads.json`, which is somebody's actual work.
+    monkeypatch.setattr(state, "STATE_DIR", tmp_path)
+    monkeypatch.setattr(state, "RECORDS_FILE", tmp_path / "leads.json")
+    monkeypatch.setattr(state, "EVENTS_FILE", tmp_path / "events.json")
+
+    async def no_model(*a, **k):
+        """What `run_agent` would have returned, without spending anything."""
+        return agent_helpers.RunResult(
+            data={"greeting": "Good morning, Ada.", "why": "she is up early"})
+
+    monkeypatch.setattr(plugin_module, "run_agent", no_model, raising=False)
+    monkeypatch.setattr(agent_helpers, "run_agent", no_model)
+
+    record = state.add_record("Ada", kind="greeting", recipient="Ada")
+    out = asyncio.run(plugin_module.write_greeting(None,
+                                                  {"record_id": record["id"]}))
+
+    assert out["ok"] is True, out
+    moved = state.get_record(record["id"])
+    assert moved["stage"] == "written"
+    assert moved["greeting"] == "Good morning, Ada."

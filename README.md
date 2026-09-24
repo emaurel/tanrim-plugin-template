@@ -5,9 +5,12 @@ plugin, small enough to read in one sitting. Clone it, rename it, replace the
 contents.
 
 It does something trivial — takes a name, has an agent write a greeting, and
-asks you before it counts as done — but it exercises every part of the
-contract: a pipeline, a room with a bench, an agent with a job, a gate, a
-hook, a record schema, prompts and a self-check.
+asks you before it counts as done — but it exercises the spine of the
+contract: a pipeline, a room with two benches, an agent with a job, a gate, a
+step gate, two kinds of hook, a record schema, prompts and a self-check.
+
+It does not show `tools()`, `routes()`, `room_handlers()`, `record_view()` or
+the patch types; [docs/CONTRACT.md](docs/CONTRACT.md) covers all of them.
 
 ```
 plugin.py            the manifest — the only required file
@@ -74,10 +77,77 @@ none.
 
 A castle for your plugin appears on the map, with The Hall in it.
 
-> **Rename the kind before you install this next to real work.** A record with
-> no explicit `kind` falls back to the first pipeline alphabetically. Installed
-> unchanged as `example`, this one wins that race, and every transition in an
-> existing ledger is then refused for being off `greeting`'s table.
+> **Rename the STAGES too, not just the id.** A record with no explicit `kind`
+> is resolved by the STAGE it is sitting at — so a generic stage id makes two
+> pipelines fight over the same kind-less records. `written` is already a stage
+> in `job_hunt`. (Only when no pipeline owns the stage does it fall back to the
+> first-declared kind, which is alphabetical directory order; that fallback is
+> the last resort now, and it used to be the only one.)
+
+## Making the first record
+
+A castle on the map with nothing in it does nothing, and the environment has
+no generic "create a record" route — what a unit of work IS belongs to your
+plugin, so opening one does too. Every real plugin creates its own, either
+from a `routes()` endpoint or from a sourcing agent.
+
+The fastest way to see the thing run, with the server stopped:
+
+```bash
+cd /path/to/agent_environment
+PYTHONPATH=backend .venv/bin/python -c "
+from tanrim import discovery, state
+discovery.boot()
+r = state.add_record('Ada', kind='greeting', recipient='Ada')
+print(r['id'], r['stage'])
+"
+```
+
+`add_record` starts it at the pipeline's `entry` stage. Start the server and
+the stage sweep dispatches The Hall to it on the next tick; the sprite walks
+to the Writing Desk, and when it is done the record is at `written` with a
+card waiting for you.
+
+For anything beyond a first look, give your plugin a `routes()` returning an
+`APIRouter`, so the app has something to call:
+
+```python
+from fastapi import APIRouter
+from pydantic import BaseModel, ConfigDict
+
+router = APIRouter()
+
+class NewGreeting(BaseModel):
+    # Refuse a body you do not understand, rather than silently ignoring a
+    # field somebody meant. A typo in a caller should 422, not no-op.
+    model_config = ConfigDict(extra="forbid")
+    recipient: str
+
+@router.post("/greetings")
+async def open_one(body: NewGreeting):
+    from tanrim import state
+    return state.add_record(body.recipient, kind="greeting",
+                            recipient=body.recipient)
+```
+
+## Saving what a job produced
+
+One function, and it is the only way a stage may change:
+
+```python
+from tanrim import state
+
+state.get_record(record_id)                  # read
+state.update_record(record_id, **fields)     # patch, no stage change
+state.advance_record(record_id, "written",   # move AND patch, one write
+                     agent="greeter", note="…", **fields)
+```
+
+`advance_record` appends to the record's history in the same write, including
+which fields the step actually changed, and **refuses an edge your pipeline
+does not declare** — logging what WAS allowed from there. It returns `None`
+on a refusal rather than raising, so a job that ignores the return value
+reports success having moved nothing.
 
 ## Reading it in the right order
 
@@ -89,8 +159,18 @@ A castle for your plugin appears on the map, with The Hall in it.
    came from, a table nothing checked had 23 declared edges against 44
    actually taken and 182 transitions off it entirely.
 
-   A move whose only role is `operator` is a **gate**: the environment raises
-   a card and waits rather than dispatching anyone.
+   A move whose only role is `operator` is a **gate** — but three things must
+   line up or nothing happens and nothing complains:
+
+   1. a **bench** in some room declares the stage, because the orchestrator
+      asks `role_for_stage` before it asks anything else, and with no bench it
+      answers `None` and the loop moves on;
+   2. every role allowed out of that stage is `operator`;
+   3. some plugin declares a `StepGate` for that `(stage, pipeline)`.
+
+   Miss the first and the record sits there for ever. That is why `hall.yaml`
+   gives `written` its own Outbox bench even though no agent works there —
+   this template shipped without it, and its one gate could never fire.
 
 2. **`rooms()`** — places on the map. A room declares **workbenches**, and a
    bench declares the stages worked at it. That is the routing table: nothing
@@ -112,9 +192,15 @@ A castle for your plugin appears on the map, with The Hall in it.
    stage. Read what you need and ignore the rest.
 
    `run_agent()` owns the turn: the sprite's busy state, the MCP servers, the
-   streaming, the token accounting, and a per-agent lock. Pass `schema=` if
-   your agent has side effects — without it, a retry re-sends the original
-   prompt, and an agent told again to "write the files now" writes them again.
+   streaming, the token accounting, and a per-agent lock.
+
+   Pass `schema=` so the one retry knows what shape to produce. If the final
+   message is not the JSON you asked for, `run_agent` retries once with the
+   bad output quoted back — **text-only and single-turn** (`allowed_tools:
+   []`), built from the transcript, never from your original prompt. Re-sending
+   the prompt is the bug that got fixed: an agent with file tools still
+   attached, told again to "write the files now", rebuilt an entire site and
+   overwrote work that had already been verified.
 
 5. **`gates()` and `step_gates()`** — what you are asked before something
    irreversible. A `StepGate` is keyed by stage rather than by edge, because
@@ -138,10 +224,19 @@ A castle for your plugin appears on the map, with The Hall in it.
 
 ## Extending someone else's plugin
 
-Declare `requires = ("their_id",)`, which orders you second and lets you win
-where you overlap. Then **patch rather than restate**:
+Declare `requires = ("their_id",)`. That guarantees you load **after** them —
+not necessarily second — so their rooms exist for you to patch.
 
-- `RoomPatch` adds a bench to a room they own.
+"Later wins" is only half true, and the half that does not is the useful one:
+two plugins declaring the same `Gate.kind` or the same `Tool.name` make boot
+**refuse**, by name. Later genuinely does win for step gates, hooks, and — in
+silence — whole `Room` and `AgentSpec` ids. That silence is the trap:
+**patch rather than restate**.
+
+- `RoomPatch` adds a bench to a room they own. A bench with a new id is added;
+  one with an existing id has its `stages` and `tasks` unioned. At the room
+  level `tools`, `skills` and `mcp_servers` are **unioned** too — only `name`,
+  `purpose`, `color`, `position`, `size` and `max_workers` override.
 - `AgentPatch` gives an existing role a job at a stage you invented.
 
 Both exist because the obvious alternative — returning a whole `Room` or
