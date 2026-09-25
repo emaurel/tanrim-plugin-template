@@ -3,7 +3,7 @@
 It lives in the environment's own repository, because a copy is a second
 version by the end of the month:
 
-**https://github.com/emaurel/agent_environment/blob/main/docs/CONTRACT.md**
+**https://github.com/emaurel/tanrim/blob/main/docs/CONTRACT.md**
 
 In a checkout you already have, it is `docs/CONTRACT.md` next to
 `backend/tanrim/`, and the file it describes is `backend/tanrim/contract.py` —

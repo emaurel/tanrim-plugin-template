@@ -1,6 +1,6 @@
 # Tanrim plugin template
 
-A complete, working [Tanrim](https://github.com/emaurel/agent_environment)
+A complete, working [Tanrim](https://github.com/emaurel/tanrim)
 plugin, small enough to read in one sitting. Clone it, rename it, replace the
 contents.
 
@@ -43,7 +43,7 @@ that contributes nothing, so you implement only what you have.
 ## Getting it running
 
 ```bash
-cd /path/to/agent_environment
+cd /path/to/tanrim
 git clone git@github.com:<you>/tanrim-plugin-template.git plugins/hello
 ```
 
@@ -94,7 +94,7 @@ from a `routes()` endpoint or from a sourcing agent.
 The fastest way to see the thing run, with the server stopped:
 
 ```bash
-cd /path/to/agent_environment
+cd /path/to/tanrim
 PYTHONPATH=backend .venv/bin/python -c "
 from tanrim import discovery, state
 discovery.boot()
